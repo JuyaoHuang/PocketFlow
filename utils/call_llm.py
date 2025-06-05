@@ -3,15 +3,16 @@ import os
 import logging
 import json
 from datetime import datetime
+from openai import OpenAI
 
-# Configure logging
+# Configure logging 配置日志记录
 log_directory = os.getenv("LOG_DIR", "logs")
 os.makedirs(log_directory, exist_ok=True)
 log_file = os.path.join(
     log_directory, f"llm_calls_{datetime.now().strftime('%Y%m%d')}.log"
 )
 
-# Set up logger
+# Set up logger 设置 Logger
 logger = logging.getLogger("llm_logger")
 logger.setLevel(logging.INFO)
 logger.propagate = False  # Prevent propagation to root logger
@@ -21,73 +22,107 @@ file_handler.setFormatter(
 )
 logger.addHandler(file_handler)
 
-# Simple cache configuration
+# Simple cache configuration 简单的缓存配置
 cache_file = "llm_cache.json"
 
 
 # By default, we Google Gemini 2.5 pro, as it shows great performance for code understanding
-def call_llm(prompt: str, use_cache: bool = True) -> str:
-    # Log the prompt
-    logger.info(f"PROMPT: {prompt}")
+# def call_llm(prompt: str, use_cache: bool = True) -> str:
+#     # Log the prompt
+#     logger.info(f"PROMPT: {prompt}")
+#
+#     # Check cache if enabled 检查缓存（如果已启用）
+#     if use_cache:
+#         # Load cache from disk
+#         cache = {}
+#         if os.path.exists(cache_file):
+#             try:
+#                 with open(cache_file, "r", encoding="utf-8") as f:
+#                     cache = json.load(f)
+#             except:
+#                 logger.warning(f"Failed to load cache, starting with empty cache")
+#
+#         # Return from cache if exists
+#         if prompt in cache:
+#             logger.info(f"RESPONSE: {cache[prompt]}")
+#             return cache[prompt]
+#
+#     # # Call the LLM if not in cache or cache disabled
+#     # client = genai.Client(
+#     #     vertexai=True,
+#     #     # TODO: change to your own project id and location
+#     #     project=os.getenv("GEMINI_PROJECT_ID", "your-project-id"),
+#     #     location=os.getenv("GEMINI_LOCATION", "us-central1")
+#     # )
+#
+#     # You can comment the previous line and use the AI Studio key instead:
+#     client = genai.Client(
+#         api_key=os.getenv("GEMINI_API_KEY", "AIzaSyDEK7mZIgXr7rI510QooUlrLXYnXp_qGeM"),
+#     )
+#     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+#     # model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+#
+#     response = client.models.generate_content(model=model, contents=[prompt])
+#     response_text = response.text
+#
+#     # Log the response
+#     logger.info(f"RESPONSE: {response_text}")
+#
+#     # Update cache if enabled
+#     if use_cache:
+#         # Load cache again to avoid overwrites
+#         cache = {}
+#         if os.path.exists(cache_file):
+#             try:
+#                 with open(cache_file, "r", encoding="utf-8") as f:
+#                     cache = json.load(f)
+#             except:
+#                 pass
+#
+#         # Add to cache and save
+#         cache[prompt] = response_text
+#         try:
+#             with open(cache_file, "w", encoding="utf-8") as f:
+#                 json.dump(cache, f)
+#         except Exception as e:
+#             logger.error(f"Failed to save cache: {e}")
+#
+#     return response_text
 
-    # Check cache if enabled
-    if use_cache:
-        # Load cache from disk
-        cache = {}
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-            except:
-                logger.warning(f"Failed to load cache, starting with empty cache")
+# Use DeepSeek API
+def call_llm(prompt, use_cache: bool = True) -> str:
+    client = OpenAI(api_key="sk-5687096c136940a4aeb7595c193f4dad", base_url="https://api.deepseek.com")
 
-        # Return from cache if exists
-        if prompt in cache:
-            logger.info(f"RESPONSE: {cache[prompt]}")
-            return cache[prompt]
-
-    # # Call the LLM if not in cache or cache disabled
-    # client = genai.Client(
-    #     vertexai=True,
-    #     # TODO: change to your own project id and location
-    #     project=os.getenv("GEMINI_PROJECT_ID", "your-project-id"),
-    #     location=os.getenv("GEMINI_LOCATION", "us-central1")
-    # )
-
-    # You can comment the previous line and use the AI Studio key instead:
-    client = genai.Client(
-        api_key=os.getenv("GEMINI_API_KEY", ""),
+    response = client.chat.completions.create(
+        model="deepseek-reasoner",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant,你的所有响应都应该以一个包含所需信息的 YAML 代码块给出"},
+            {"role": "user", "content": f"{prompt}\n请将上述内容转换为YAML格式，并用```yaml ```包裹起来。例如：\n```yaml\nkey: value\n```"},
+        ],
+        stream=False
     )
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro-exp-03-25")
-    # model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
-    
-    response = client.models.generate_content(model=model, contents=[prompt])
-    response_text = response.text
 
-    # Log the response
-    logger.info(f"RESPONSE: {response_text}")
+    return response.choices[0].message.content
 
-    # Update cache if enabled
-    if use_cache:
-        # Load cache again to avoid overwrites
-        cache = {}
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-            except:
-                pass
-
-        # Add to cache and save
-        cache[prompt] = response_text
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
-        except Exception as e:
-            logger.error(f"Failed to save cache: {e}")
-
-    return response_text
-
+# Extract YAML content from the response text
+def extract_yaml_from_response(response_text: str) -> str:
+    response_text = response_text.strip()
+    if "```yaml" in response_text:
+        parts = response_text.split("```yaml", 1)
+        if len(parts) > 1:
+            yaml_content_with_end_tag = parts[1].strip()
+            if "```" in yaml_content_with_end_tag:
+                yaml_str = yaml_content_with_end_tag.split("```", 1)[0].strip()
+                return yaml_str
+            else:
+                print("警告: 找到 '```yaml' 但未找到结束标记 '```'. 尝试返回部分内容。")
+                return yaml_content_with_end_tag.strip()
+        else:
+            print("警告: 找到 '```yaml' 但其后没有内容.")
+            return ""
+    else:
+        print("警告: 响应中未找到 '```yaml' 标记.")
+        return ""
 
 # # Use Azure OpenAI
 # def call_llm(prompt, use_cache: bool = True):
@@ -232,4 +267,11 @@ if __name__ == "__main__":
     # First call - should hit the API
     print("Making call...")
     response1 = call_llm(test_prompt, use_cache=False)
-    print(f"Response: {response1}")
+    extracted_yaml = extract_yaml_from_response(response1)
+    if extracted_yaml:
+        print("成功提取到 YAML:")
+        print(extracted_yaml)
+        # 进一步使用 PyYAML 解析 extracted_yaml
+    else:
+        print("未成功提取到 YAML。原始响应：")
+        print(response1)

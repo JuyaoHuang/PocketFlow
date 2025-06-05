@@ -109,3 +109,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python main.py --dir D:/Coding/GitHub_Resuorse/Pocketflow/PocketFlow --language "Chinese"
+# python main.py --dir D:/Coding/GitHub_Resuorse/new-llmvtuber/Open-LLM-VTuber --language "Chinese" -e ".venv/*" "asserts/*" "avatars/*" "backgrounds/*" "characters/*" "chat_history/*" "doc/*" "logs/*" "live2d-models/*"
