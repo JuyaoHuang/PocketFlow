@@ -278,118 +278,208 @@ class IdentifyAbstractions(Node):
     def exec(self, prep_res):
         (
             llm_chunks,
-            file_into_map,
-            file_count,
+            file_info_map,
             project_name,
             language,
             use_cache,
             max_abstraction_num,
-        ) = prep_res  # Unpack all parameters
-        print(f"Identifying abstractions using LLM...")
+        ) = prep_res
+        print(f"Identifying abstractions using LLM...Processing {len(llm_chunks)} chunks")
 
-        # Add language instruction and hints only if not English
+        # --- LLM Client 获取/初始化 ---
+        # 确保 client 对象可用。这取决于你的 PocketFlow 项目如何管理 LLM 客户端。
+        # 推荐的做法是在 main.py 或某个初始化文件中创建 client 对象，并通过 shared 字典传递。
+        client = self.shared.get("llm_client", None)
+        if not client:
+            print("WARNING: LLM client not found in shared. Initializing a default client. Make sure API key is set.")
+            from openai import OpenAI # 在这里导入，如果上面没导入
+            # !!! 务必替换为你的 DeepSeek API Key 和 Base URL !!!
+            client = OpenAI(api_key=os.environ.get("deepseek_api_key"), base_url="https://api.deepseek.com")
+            self.shared["llm_client"] = client # 可选：将新创建的客户端存回 shared，供其他节点使用
+
+        # 语言指令
         language_instruction = ""
-        name_lang_hint = ""
-        desc_lang_hint = ""
         if language.lower() != "english":
-            language_instruction = f"IMPORTANT: Generate the `name` and `description` for each abstraction in **{language.capitalize()}** language. Do NOT use English for these fields.\n\n"
-            # Keep specific hints here as name/description are primary targets
-            name_lang_hint = f" (value in {language.capitalize()})"
-            desc_lang_hint = f" (value in {language.capitalize()})"
+            language_instruction = f"IMPORTANT: Generate the `name` and `description` for each abstraction in **{language.capitalize()}** language. Do NOT use English for these fields.\n"
 
-        prompt = f"""
-For the project `{project_name}`:
+        # System message (保持不变，或根据需要微调)
+        system_message_content = f"""You are an AI assistant specialized in identifying logical abstractions from provided code contexts.
+Your response MUST be a YAML code block, enclosed in triple backticks with 'yaml' language specifier (```yaml ... ```).
+The YAML should contain a top-level key 'abstractions' which is a list. Each item in this list represents an abstraction and must have the following keys:
+- `name`: A concise and descriptive name for the abstraction.
+- `description`: A brief explanation of what the abstraction represents, its purpose, and key components.
+- `files`: (Optional) A list of file indices (from the provided file listing) that are most relevant to this abstraction.
 
-Codebase Context:
-{context}
-
-{language_instruction}Analyze the codebase context.
-Identify the top 5-{max_abstraction_num} core most important abstractions to help those new to the codebase.
-
-For each abstraction, provide:
-1. A concise `name`{name_lang_hint}.
-2. A beginner-friendly `description` explaining what it is with a simple analogy, in around 100 words{desc_lang_hint}.
-3. A list of relevant `file_indices` (integers) using the format `idx # path/comment`.
-
-List of file indices and paths present in the context:
-{file_listing_for_prompt}
-
-Format the output as a YAML list of dictionaries:
-
+Example YAML structure:
 ```yaml
-- name: |
-    Query Processing{name_lang_hint}
-  description: |
-    Explains what the abstraction does.
-    It's like a central dispatcher routing requests.{desc_lang_hint}
-  file_indices:
-    - 0 # path/to/file1.py
-    - 3 # path/to/related.py
-- name: |
-    Query Optimization{name_lang_hint}
-  description: |
-    Another core concept, similar to a blueprint for objects.{desc_lang_hint}
-  file_indices:
-    - 5 # path/to/another.js
-# ... up to {max_abstraction_num} abstractions
-```"""
-        response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))  # Use cache only if enabled and not retrying
+abstractions:
+  - name: User Authentication Service
+    description: Handles user login, registration, and session management. Interacts with the database for user data.
+    files: [0, 2]
+  - name: Data Processing Pipeline
+    description: A sequence of operations to transform raw input data into a structured format for analysis. Includes parsing, validation, and normalization steps.
+    files: [1, 3]```
+    Ensure the YAML is valid and strictly follows this structure.
+    """
 
-        # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
-        abstractions = yaml.safe_load(yaml_str)
+        # --- 以下是新增或修改的逻辑 ---
+        all_identified_abstractions = []
 
-        if not isinstance(abstractions, list):
-            raise ValueError("LLM Output is not a list")
-
-        validated_abstractions = []
-        for item in abstractions:
-            if not isinstance(item, dict) or not all(
-                k in item for k in ["name", "description", "file_indices"]
-            ):
-                raise ValueError(f"Missing keys in abstraction item: {item}")
-            if not isinstance(item["name"], str):
-                raise ValueError(f"Name is not a string in item: {item}")
-            if not isinstance(item["description"], str):
-                raise ValueError(f"Description is not a string in item: {item}")
-            if not isinstance(item["file_indices"], list):
-                raise ValueError(f"file_indices is not a list in item: {item}")
-
-            # Validate indices
-            validated_indices = []
-            for idx_entry in item["file_indices"]:
-                try:
-                    if isinstance(idx_entry, int):
-                        idx = idx_entry
-                    elif isinstance(idx_entry, str) and "#" in idx_entry:
-                        idx = int(idx_entry.split("#")[0].strip())
-                    else:
-                        idx = int(str(idx_entry).strip())
-
-                    if not (0 <= idx < file_count):
-                        raise ValueError(
-                            f"Invalid file index {idx} found in item {item['name']}. Max index is {file_count - 1}."
-                        )
-                    validated_indices.append(idx)
-                except (ValueError, TypeError):
-                    raise ValueError(
-                        f"Could not parse index from entry: {idx_entry} in item {item['name']}"
-                    )
-
-            item["files"] = sorted(list(set(validated_indices)))
-            # Store only the required fields
-            validated_abstractions.append(
-                {
-                    "name": item["name"],  # Potentially translated name
-                    "description": item[
-                        "description"
-                    ],  # Potentially translated description
-                    "files": item["files"],
-                }
+        # 遍历每个文件块，独立调用 LLM
+        for i, chunk in enumerate(llm_chunks):
+            chunk_context = chunk["context"]
+            chunk_file_indices = chunk["file_indices"]
+            
+            # 为当前块生成文件列表提示
+            # 确保 file_info_map 的键是文件路径，值是索引
+            # 修正：file_info_map 是 path -> index，所以需要根据 indices 反查 path
+            # 或者更直接地，可以在 chunk_files_into_llm_contexts 存储 (index, path)
+            # 假设 file_info_map 仍是 path -> index，需要逆向查找或重新组织
+            # 这里我们基于 chunk_file_indices 查找对应的文件路径
+            files_in_this_chunk = [path for path, idx in file_info_map.items() if idx in chunk_file_indices]
+            chunk_file_listing_for_prompt = "\n".join(
+                [f"- {file_info_map[path]} # {path}" for path in files_in_this_chunk]
             )
+            print(f"Processing chunk {i+1}/{len(llm_chunks)} (files: {chunk_file_indices})...")
 
-        print(f"Identified {len(validated_abstractions)} abstractions.")
-        return validated_abstractions
+            user_message_content = f"""
+{language_instruction}
+Analyze the following code context from the project "{project_name}":
+--- Code Context ---
+{chunk_context}
+--------------------
+--- File Listing ---
+{chunk_file_listing_for_prompt}
+--------------------
+Based on the provided context, identify up to {max_abstraction_num} significant logical abstractions.
+For each abstraction, provide its `name` and `description` as specified in the system message.
+Also, link relevant `files` by their index from the file listing.
+Note: The context provided is a part of the full project. Focus on abstractions identifiable within this chunk.
+Please provide the identified abstractions strictly in the YAML format as specified.
+"""        
+            messages_to_send = [
+                {"role": "system", "content": system_message_content},
+                {"role": "user", "content": user_message_content},
+            ]
+
+            try:
+                # --- DEBUGGING: 检查 prompt 的总 token 数 ---
+                # 在这里，我们需要知道 MAX_TOTAL_TOKENS，从 prep 阶段获取或者在类中定义
+                # 假设 MAX_TOTAL_TOKENS 是在类级别定义的常量或者通过 __init__ 传递
+                # 这里我们再次定义，确保它存在
+                MAX_TOTAL_TOKENS = 65535 # DeepSeek Reasoner 的限制
+                encoding = encoding_for_model("gpt-4") # 或 DeepSeek 专用 tokenizer
+                total_prompt_tokens = len(encoding.encode(system_message_content)) + len(encoding.encode(user_message_content))
+                print(f"DEBUG: Chunk {i+1} prompt total tokens: {total_prompt_tokens}")
+                if total_prompt_tokens > MAX_TOTAL_TOKENS:
+                    print(f"ERROR: Chunk {i+1} prompt exceeds total max tokens ({MAX_TOTAL_TOKENS})! This should not happen if chunking is correct. Please review chunking logic.")
+                    raise ValueError(f"Prompt for chunk {i+1} exceeded max token limit.")
+                # 调用 LLM (client 已在 exec 开头获取)
+                # 原来的 `call_llm` 函数已不再使用，直接调用 client.chat.completions.create
+                response_obj = client.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=messages_to_send,
+                    stream=False
+                )
+                llm_response = response_obj.choices[0].message.content
+
+                print(f"DEBUG: Chunk {i+1} LLM Response (partial):\n{llm_response[:500]}...") # 打印部分响应
+
+                yaml_str = extract_yaml_from_response(llm_response)
+                
+                if not yaml_str:
+                    print(f"WARNING: Chunk {i+1}: LLM did not return a valid YAML block. Skipping this chunk's results.")
+                    continue # 跳过当前块，处理下一个
+
+                # 尝试解析 YAML
+                chunk_abstractions_data = yaml.safe_load(yaml_str)
+
+                if isinstance(chunk_abstractions_data, dict) and "abstractions" in chunk_abstractions_data and isinstance(chunk_abstractions_data["abstractions"], list):
+                    all_identified_abstractions.extend(chunk_abstractions_data["abstractions"])
+                else:
+                    print(f"WARNING: Chunk {i+1}: Parsed YAML has unexpected structure. Skipping this chunk's results. Got: {chunk_abstractions_data}")
+
+            except Exception as e:
+                print(f"ERROR: Failed to process chunk {i+1} with LLM: {e}. Skipping this chunk.")
+                # 可以选择在这里重试或者记录更多错误信息
+                continue # 继续处理下一个块
+
+        print(f"Finished processing all chunks. Total raw abstractions identified: {len(all_identified_abstractions)}")
+
+        # --- 最后一步：合并和去重所有抽象 ---
+        print("Merging and deduplicating abstractions using LLM...")
+        final_abstractions = merge_and_deduplicate_abstractions(all_identified_abstractions, client, language)
+        
+        # 返回最终的抽象列表
+        return final_abstractions
+
+        # 原始代码
+        # # Add language instruction and hints only if not English
+        # language_instruction = ""
+        # name_lang_hint = ""
+        # desc_lang_hint = ""
+        # if language.lower() != "english":
+        #     language_instruction = f"IMPORTANT: Generate the `name` and `description` for each abstraction in **{language.capitalize()}** language. Do NOT use English for these fields.\n\n"
+        #     # Keep specific hints here as name/description are primary targets
+        #     name_lang_hint = f" (value in {language.capitalize()})"
+        #     desc_lang_hint = f" (value in {language.capitalize()})"
+        # response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))  # Use cache only if enabled and not retrying
+
+        # # --- Validation ---
+        # yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        # abstractions = yaml.safe_load(yaml_str)
+
+        # if not isinstance(abstractions, list):
+        #     raise ValueError("LLM Output is not a list")
+
+        # validated_abstractions = []
+        # for item in abstractions:
+        #     if not isinstance(item, dict) or not all(
+        #         k in item for k in ["name", "description", "file_indices"]
+        #     ):
+        #         raise ValueError(f"Missing keys in abstraction item: {item}")
+        #     if not isinstance(item["name"], str):
+        #         raise ValueError(f"Name is not a string in item: {item}")
+        #     if not isinstance(item["description"], str):
+        #         raise ValueError(f"Description is not a string in item: {item}")
+        #     if not isinstance(item["file_indices"], list):
+        #         raise ValueError(f"file_indices is not a list in item: {item}")
+
+        #     # Validate indices
+        #     validated_indices = []
+        #     for idx_entry in item["file_indices"]:
+        #         try:
+        #             if isinstance(idx_entry, int):
+        #                 idx = idx_entry
+        #             elif isinstance(idx_entry, str) and "#" in idx_entry:
+        #                 idx = int(idx_entry.split("#")[0].strip())
+        #             else:
+        #                 idx = int(str(idx_entry).strip())
+
+        #             if not (0 <= idx < file_count):
+        #                 raise ValueError(
+        #                     f"Invalid file index {idx} found in item {item['name']}. Max index is {file_count - 1}."
+        #                 )
+        #             validated_indices.append(idx)
+        #         except (ValueError, TypeError):
+        #             raise ValueError(
+        #                 f"Could not parse index from entry: {idx_entry} in item {item['name']}"
+        #             )
+
+        #     item["files"] = sorted(list(set(validated_indices)))
+        #     # Store only the required fields
+        #     validated_abstractions.append(
+        #         {
+        #             "name": item["name"],  # Potentially translated name
+        #             "description": item[
+        #                 "description"
+        #             ],  # Potentially translated description
+        #             "files": item["files"],
+        #         }
+        #     )
+
+        # print(f"Identified {len(validated_abstractions)} abstractions.")
+        # return validated_abstractions
 
     def post(self, shared, prep_res, exec_res):
         shared["abstractions"] = (

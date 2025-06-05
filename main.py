@@ -3,6 +3,7 @@ import os
 import argparse
 # Import the function that creates the flow
 from flow import create_tutorial_flow
+from openai import OpenAI 
 
 dotenv.load_dotenv()
 
@@ -97,9 +98,32 @@ def main():
         "final_output_dir": None
     }
 
+    # --- 在这里添加 LLM 客户端的初始化 ---
+    # 确保你有 DeepSeek API Key。可以从环境变量读取，或者直接赋值 (不推荐直接在代码中硬编码)
+    deepseek_api_key = os.environ.get("deepseek_api_key") # 建议只从环境变量读取
+    
+    if not deepseek_api_key:
+        print("ERROR: DeepSeek API Key (DEEPSEEK_API_KEY environment variable) is not set.")
+        print("Please set the DEEPSEEK_API_KEY environment variable before running the script.")
+        # 如果你决定不处理错误，就注释掉下面的 return/sys.exit
+        return # 或者 sys.exit(1)
+
+    try:
+        deepseek_client = OpenAI(
+            api_key=deepseek_api_key,
+            base_url="https://api.deepseek.com" # DeepSeek API 的正确 base_url
+        )
+        shared["llm_client"] = deepseek_client # 将客户端实例存入 shared 字典
+        print("DEBUG: DeepSeek LLM client initialized and added to shared.")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize DeepSeek LLM client: {e}")
+        # 如果你决定不处理错误，就注释掉下面的 return/sys.exit
+        return # 或者 sys.exit(1)
+    # --- LLM 客户端初始化结束 ---
+
     # Display starting message with repository/directory and language
     print(f"Starting tutorial generation for: {args.repo or args.dir} in {args.language.capitalize()} language")
-    print(f"LLM caching: {'Disabled' if args.no_cache else 'Enabled'}")
+    print(f"LLM caching: {'Disabled' if args.no_cache else 'Enabled'}")    
 
     # Create the flow instance
     tutorial_flow = create_tutorial_flow()
