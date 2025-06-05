@@ -5,7 +5,128 @@ from pocketflow import Node, BatchNode
 from utils.crawl_github_files import crawl_github_files
 from utils.call_llm import call_llm
 from utils.crawl_local_files import crawl_local_files
+from tiktoken import encoding_for_model
 
+# 辅助函数，用于提取YAML块
+def extract_yaml_from_response(response_text: str) -> str:
+    match = re.search(r"```yaml\s*(.*?)\s*```", response_text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    else:
+        print(f"\n--- 警告: 未找到YAML代码块。原始LLM响应如下 ---\n{response_text}\n--------------------------------------------\n")
+        return ""
+
+# --- 辅助函数,将文件分割成适合LLM的块 deepseek 最大长度是64K 65536---
+def chunk_files_into_llm_contexts(files_data, max_tokens_per_chunk_for_context, model_name="deepseek-reasoner"):
+    """
+    将文件数据分割成适合LLM上下文窗口的块。
+    每个块包含一个或多个文件的内容。
+    """
+    encoding = encoding_for_model("gpt-4") # 假设 deepseek-reasoner 兼容 gpt-4 的 tokenizer
+
+    chunks = []
+    current_chunk_files = []    
+    current_chunk_tokens = 0
+
+    file_info_map = {} # 存储文件路径到其索引的映射，用于在抽象中引用
+    for i, (path, content) in enumerate(files_data):
+        file_info_map[path] = i
+
+    for path, content in files_data:
+        file_content_tokens = len(encoding.encode(content))
+
+        # 尝试将当前文件添加到当前块
+        if current_chunk_tokens + file_content_tokens <= max_tokens_per_chunk_for_context:
+            current_chunk_files.append((path, content))
+            current_chunk_tokens += file_content_tokens
+        else:
+            # 如果当前块已满，保存当前块并开始新块
+            if current_chunk_files: # 确保当前块不为空
+                chunk_context = ""
+                chunk_file_indices = []
+                for p, c in current_chunk_files:
+                    chunk_context += f"--- File Index {file_info_map[p]}: {p} ---\n{c}\n\n"
+                    chunk_file_indices.append(file_info_map[p])
+                chunks.append({
+                    "context": chunk_context,
+                    "file_indices": chunk_file_indices # 记录这个块包含的文件索引
+                })
+
+            # 开始新块，将当前文件添加到新块中
+            current_chunk_files = [(path, content)]
+            current_chunk_tokens = file_content_tokens
+            
+            # 检查单个文件是否超过限制
+            if file_content_tokens > max_tokens_per_chunk_for_context:
+                print(f"WARNING: File '{path}' ({file_content_tokens} tokens) exceeds max_tokens_per_chunk_for_context ({max_tokens_per_chunk_for_context}). It will be truncated.")
+                # 这里简单处理：只取文件开头部分
+                truncated_tokens = encoding.encode(content)[:max_tokens_per_chunk_for_context]
+                truncated_content = encoding.decode(truncated_tokens)
+                chunk_context = f"--- File Index {file_info_map[path]}: {path} (TRUNCATED) ---\n{truncated_content}\n\n"
+                chunks.append({
+                    "context": chunk_context,
+                    "file_indices": [file_info_map[path]]
+                })
+                current_chunk_files = [] # 清空，因为它已经单独处理了
+                current_chunk_tokens = 0
+                
+    # 添加最后一个块（如果存在）
+    if current_chunk_files:
+        chunk_context = ""
+        chunk_file_indices = []
+        for p, c in current_chunk_files:
+            chunk_context += f"--- File Index {file_info_map[p]}: {p} ---\n{c}\n\n"
+            chunk_file_indices.append(file_info_map[p])
+        chunks.append({
+            "context": chunk_context,
+            "file_indices": chunk_file_indices
+        })
+        
+    print(f"DEBUG: Split {len(files_data)} files into {len(chunks)} LLM chunks.")
+    return chunks, file_info_map # 返回分块和文件信息映射
+
+# --- 新的辅助函数：合并和去重抽象 ---
+def merge_and_deduplicate_abstractions(all_abstractions: list, llm_client, language: str = "english"):
+    """
+    使用LLM来合并和去重从多个块中识别出的抽象。
+    """
+    if not all_abstractions:
+        return []
+
+    # 将所有抽象转换为一个易于LLM理解的字符串格式
+    abstractions_str = ""
+    for i, abs_item in enumerate(all_abstractions):
+        name = abs_item.get("name", "N/A")
+        desc = abs_item.get("description", "N/A")
+        files = abs_item.get("files", [])
+        abstractions_str += f"### Abstraction {i+1}:\nName: {name}\nDescription: {desc}\nFiles: {files}\n---\n"
+
+    lang_instruction = ""
+    if language.lower() != "english":
+        lang_instruction = f"IMPORTANT: Ensure `name` and `description` are in **{language.capitalize()}**.\n"
+
+    system_message_content = f"""You are an expert AI assistant tasked with reviewing, synthesizing, and deduplicating a list of identified logical abstractions.
+Your goal is to produce a refined, coherent, and unique list of abstractions.
+Combine abstractions that are clearly the same or highly overlapping.
+Refine names and descriptions for clarity and conciseness.
+If files are listed, try to consolidate them where appropriate.
+Your response MUST be a YAML code block, enclosed in triple backticks with 'yaml' language specifier (```yaml ... ```).
+The YAML should contain a top-level key 'abstractions' which is a list. Each item in this list represents an abstraction and must have the following keys:
+- `name`: A concise and descriptive name for the abstraction.
+- `description`: A brief explanation of what the abstraction represents, its purpose, and key components.
+- `files`: (Optional) A list of file indices (from the provided file listing) that are most relevant to this abstraction.
+{lang_instruction}
+Example YAML structure:
+```yaml
+abstractions:
+- name: User Authentication Service
+    description: Handles user login, registration, and session management. Interacts with the database for user data.
+    files: [0, 2]
+- name: Data Processing Pipeline
+    description: A sequence of operations to transform raw input data into a structured format for analysis. Includes parsing, validation, and normalization steps.
+    files: [1, 3]```
+Ensure the YAML is valid and strictly follows this structure.
+"""
 
 # Helper to get content for specific file indices
 def get_content_for_indices(files_data, indices):
@@ -80,7 +201,21 @@ class FetchRepo(Node):
     def post(self, shared, prep_res, exec_res):
         shared["files"] = exec_res  # List of (path, content) tuples
 
-
+# 修改类，使其不再直接生成一个巨大的context，而是分块处理文件数据
+# 修改 IdentifyAbstractions 类的 prep 方法：
+# 它将不再直接生成一个巨大的 context。
+# 它会调用 chunk_files_into_llm_contexts 函数来生成一个分块列表。
+# prep 方法需要将这个分块列表（以及其他必要的参数）返回，供 exec 方法使用。
+# 修改 IdentifyAbstractions 类的 exec 方法：
+# exec 方法将迭代处理由 prep 返回的每个文件块。
+# 对于每个块，它会构造一个独立的 LLM prompt。
+# 调用 LLM 客户端（确保 client 对象可用）。
+# 收集每个 LLM 调用返回的抽象结果。
+# 在所有块处理完毕后，调用 merge_and_deduplicate_abstractions 函数来汇总最终结果。
+# 确保 LLM 客户端 (client) 可用：
+# exec 方法和 merge_and_deduplicate_abstractions 函数都需要一个 LLM 客户端对象来调用 API。
+# 你需要确保这个 client 对象在 exec 方法的作用域内是可访问的。
+# 最常见的情况： 在 main.py 或 PocketFlow 的某个初始化脚本中创建 openai.OpenAI 实例，并将其添加到 shared 字典中，然后在节点中从 shared 中获取。
 class IdentifyAbstractions(Node):
     def prep(self, shared):
         files_data = shared["files"]
@@ -89,36 +224,61 @@ class IdentifyAbstractions(Node):
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
         max_abstraction_num = shared.get("max_abstraction_num", 10)  # Get max_abstraction_num, default to 10
 
-        # Helper to create context from files, respecting limits (basic example)
-        def create_llm_context(files_data):
-            context = ""
-            file_info = []  # Store tuples of (index, path)
-            for i, (path, content) in enumerate(files_data):
-                entry = f"--- File Index {i}: {path} ---\n{content}\n\n"
-                context += entry
-                file_info.append((i, path))
+        # 在 pre 阶段进行分块
+        MAX_TOTAL_TOKENS = 65535 # DeepSeek Reasoner 的限制
+        SAFETY_BUFFER_TOKENS = 8000 # 经验值，可以根据实际情况调整
+        # 计算每个块可用于 'context' 的最大 token 数量
+        MAX_TOKENS_FOR_CONTEXT_PER_CHUNK = MAX_TOTAL_TOKENS - SAFETY_BUFFER_TOKENS
 
-            return context, file_info  # file_info is list of (index, path)
+        if MAX_TOKENS_FOR_CONTEXT_PER_CHUNK <= 0:
+            raise ValueError("Insufficient token budget for context. Please reduce SAFETY_BUFFER_TOKENS or increase MAX_TOTAL_TOKENS if possible.")
+            
+        print(f"DEBUG: Max tokens per chunk for context: {MAX_TOKENS_FOR_CONTEXT_PER_CHUNK}")
 
-        context, file_info = create_llm_context(files_data)
-        # Format file info for the prompt (comment is just a hint for LLM)
-        file_listing_for_prompt = "\n".join(
-            [f"- {idx} # {path}" for idx, path in file_info]
+        # 调用辅助函数进行文件分块
+        llm_chunks, file_info_map = chunk_files_into_llm_contexts(
+            files_data, MAX_TOKENS_FOR_CONTEXT_PER_CHUNK
         )
+
+        # prep 返回现在是这些分块数据
         return (
-            context,
-            file_listing_for_prompt,
-            len(files_data),
+            llm_chunks,        # 列表，每个元素是一个 {'context': ..., 'file_indices': [...]}
+            file_info_map,     # 文件路径到索引的映射
             project_name,
             language,
             use_cache,
             max_abstraction_num,
-        )  # Return all parameters
+        )
+        # # Helper to create context from files, respecting limits (basic example)
+        # def create_llm_context(files_data):
+        #     context = ""
+        #     file_info = []  # Store tuples of (index, path)
+        #     for i, (path, content) in enumerate(files_data):
+        #         entry = f"--- File Index {i}: {path} ---\n{content}\n\n"
+        #         context += entry
+        #         file_info.append((i, path))
+
+        #     return context, file_info  # file_info is list of (index, path)
+
+        # context, file_info = create_llm_context(files_data)
+        # # Format file info for the prompt (comment is just a hint for LLM)
+        # file_listing_for_prompt = "\n".join(
+        #     [f"- {idx} # {path}" for idx, path in file_info]
+        # )
+        # return (
+        #     context,
+        #     file_listing_for_prompt,
+        #     len(files_data),
+        #     project_name,
+        #     language,
+        #     use_cache,
+        #     max_abstraction_num,
+        # )  # Return all parameters
 
     def exec(self, prep_res):
         (
-            context,
-            file_listing_for_prompt,
+            llm_chunks,
+            file_into_map,
             file_count,
             project_name,
             language,
