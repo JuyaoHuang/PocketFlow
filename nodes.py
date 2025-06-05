@@ -218,6 +218,9 @@ class FetchRepo(Node):
 # 最常见的情况： 在 main.py 或 PocketFlow 的某个初始化脚本中创建 openai.OpenAI 实例，并将其添加到 shared 字典中，然后在节点中从 shared 中获取。
 class IdentifyAbstractions(Node):
     def prep(self, shared):
+        # 将self.shared 赋值给 shared，确保可以访问 shared 字典
+        self.shared = shared
+
         files_data = shared["files"]
         project_name = shared["project_name"]  # Get project name
         language = shared.get("language", "english")  # Get language
@@ -410,6 +413,20 @@ Please provide the identified abstractions strictly in the YAML format as specif
         print("Merging and deduplicating abstractions using LLM...")
         final_abstractions = merge_and_deduplicate_abstractions(all_identified_abstractions, client, language)
         
+        # 手动将最终抽象列表存入 shared 字典 ,解决
+        # File "D:\Coding\GitHub_Resuorse\Pocketflow\PocketFlow\nodes.py", line 504, in prep
+        # num_abstractions = len(abstractions)
+        #                    ^^^^^^^^^^^^^^^^^
+        # TypeError: object of type 'NoneType' has no len()
+        # 报错
+        self.shared["abstractions"] = final_abstractions 
+
+        print("\n--- DEBUG: Inside IdentifyAbstractions.exec, after setting shared['abstractions'] ---")
+        print(f"self.shared['abstractions'] type: {type(self.shared.get('abstractions'))}")
+        print(f"self.shared['abstractions'] len: {len(self.shared.get('abstractions', []))}")
+        # print(self.shared) # 如果要看全部 shared 内容
+        print("----------------------------------------------------------------------------------\n")
+
         # 返回最终的抽象列表
         return final_abstractions
 
@@ -489,13 +506,41 @@ Please provide the identified abstractions strictly in the YAML format as specif
 
 class AnalyzeRelationships(Node):
     def prep(self, shared):
-        abstractions = shared[
-            "abstractions"
-        ]  # Now contains 'files' list of indices, name/description potentially translated
+        # Ensure we can access shared dictionary 
+        self.shared = shared  
+
+        print("\n--- DEBUG: Inside AnalyzeRelationships.prep, at start ---")
+        print(f"shared content: {shared}") # 打印完整的 shared 字典
+        print(f"shared['abstractions'] type: {type(shared.get('abstractions'))}")
+        print("----------------------------------------------------------\n")
+
+        # --- 修正：使用 .get() 方法安全获取，并检查结果 ---
+        abstractions = shared.get("abstractions") 
+        # abstractions = shared[
+        #     "abstractions"
+        # ]  # Now contains 'files' list of indices, name/description potentially translated
+
+        # 检查 abstractions 是否存在且是列表
+        if abstractions is None:
+            # 如果 abstractions 不存在，这可能意味着 IdentifyAbstractions 节点失败或没有正确存储结果
+            print("ERROR: 'abstractions' not found in shared dictionary. Cannot proceed with relationship analysis.")
+            # 抛出异常，阻止流程继续，因为缺少关键数据
+            raise ValueError("Required 'abstractions' data is missing from shared dictionary.")
+        
+        if not isinstance(abstractions, list):
+            # 如果 abstractions 存在但不是列表，说明数据类型不正确
+            print(f"ERROR: 'abstractions' in shared is not a list (type: {type(abstractions)}). Expected a list of abstractions.")
+            raise TypeError(f"Expected 'abstractions' to be a list, but got {type(abstractions)}.")
+        # --- 修正结束 ---
+                
         files_data = shared["files"]
         project_name = shared["project_name"]  # Get project name
         language = shared.get("language", "english")  # Get language
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
+
+
+
+
 
         # Get the actual number of abstractions directly
         num_abstractions = len(abstractions)
